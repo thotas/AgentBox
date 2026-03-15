@@ -183,6 +183,9 @@ struct AgentBoxSettings: Codable, Equatable {
     var pythonExecutable: String
     var useCLIMode: Bool
 
+    // Project directory for file-capable agents
+    var projectDirectory: String
+
     // CLI commands (can include arguments like "cmd1 && cmd2")
     var claudeCLICommand: String
     var codexCLICommand: String
@@ -190,6 +193,15 @@ struct AgentBoxSettings: Codable, Equatable {
     var minimaxCLICommand: String
     var ollamaCLICommand: String
     var ollamaModelName: String
+
+    // MiniMax configuration (used when agent is "minimax")
+    var minimaxBaseURL: String
+    var minimaxAuthToken: String
+    var minimaxModelName: String
+
+    // Orchestration script (when useOrchestrateScript = true)
+    var useOrchestrateScript: Bool
+    var orchestrateScriptPath: String
 
     static let modelOptions: [String] = [
         "anthropic sonnet",
@@ -209,6 +221,10 @@ struct AgentBoxSettings: Codable, Equatable {
         let root = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("AgentBox", isDirectory: true)
 
+        // Try to detect common project directories
+        let devPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Development", isDirectory: true).path
+
         return AgentBoxSettings(
             managerModelId: "claude-cli",
             workerModelId: "ollama llama3.3",
@@ -218,12 +234,18 @@ struct AgentBoxSettings: Codable, Equatable {
             completedPath: root.appendingPathComponent("03_Completed", isDirectory: true).path,
             pythonExecutable: "/usr/bin/python3",
             useCLIMode: true,
+            projectDirectory: devPath,
             claudeCLICommand: "/opt/homebrew/bin/claude -p {PROMPT}",
-            codexCLICommand: "/opt/homebrew/bin/codex exec --skip-git-repo-check {PROMPT}",
+            codexCLICommand: "/opt/homebrew/bin/codex --quiet {PROMPT}",
             geminiCLICommand: "/opt/homebrew/bin/gemini {PROMPT}",
-            minimaxCLICommand: "/opt/homebrew/bin/minimax {PROMPT}",
+            minimaxCLICommand: "/opt/homebrew/bin/claude -p {PROMPT}",
             ollamaCLICommand: "/usr/local/bin/ollama run llama3",
-            ollamaModelName: "llama3"
+            ollamaModelName: "llama3",
+            minimaxBaseURL: "https://api.minimax.io/anthropic",
+            minimaxAuthToken: "",
+            minimaxModelName: "kimi-k2.5:cloud",
+            useOrchestrateScript: false,
+            orchestrateScriptPath: ""
         )
     }
 

@@ -34,7 +34,7 @@ final class AgentBoxTests: XCTestCase {
 
     func testSavingAPIKeysDoesNotThrowWhenKeychainIsUnavailable() {
         let service = KeychainService()
-        let keys = APIKeys(claude: "a", gemini: "g", minimax: "m", codex: "c")
+        let keys = APIKeys(claude: "a", gemini: "g", minimax: "m", codex: "c", openai: "")
         XCTAssertNoThrow(try service.saveKeys(keys))
     }
 
@@ -47,7 +47,7 @@ final class AgentBoxTests: XCTestCase {
         defer { unsetenv("AGENTBOX_FORCE_KEYCHAIN_FAILURE") }
 
         let service = KeychainService()
-        let keys = APIKeys(claude: "aa", gemini: "gg", minimax: "mm", codex: "cc")
+        let keys = APIKeys(claude: "aa", gemini: "gg", minimax: "mm", codex: "cc", openai: "")
         let destination = try service.saveKeys(keys)
         let loaded = service.loadKeys()
 
@@ -64,15 +64,10 @@ final class AgentBoxTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentBoxTests_\(UUID().uuidString)", isDirectory: true)
 
-        let settings = AgentBoxSettings(
-            managerModel: "m",
-            workerModel: "w1",
-            pollingIntervalSeconds: 900,
-            inboxPath: root.appendingPathComponent("01_Inbox", isDirectory: true).path,
-            processingPath: root.appendingPathComponent("02_Processing", isDirectory: true).path,
-            completedPath: root.appendingPathComponent("03_Completed", isDirectory: true).path,
-            pythonExecutable: "/usr/bin/python3"
-        )
+        var settings = AgentBoxSettings.defaultValue()
+        settings.inboxPath = root.appendingPathComponent("01_Inbox", isDirectory: true).path
+        settings.processingPath = root.appendingPathComponent("02_Processing", isDirectory: true).path
+        settings.completedPath = root.appendingPathComponent("03_Completed", isDirectory: true).path
 
         let bridge = FileBridgeService()
         try await bridge.ensureDirectories(for: settings)
@@ -101,16 +96,14 @@ final class AgentBoxTests: XCTestCase {
             .appendingPathComponent("AgentBoxBridge_\(UUID().uuidString).txt")
         try Data("Summarize this task.".utf8).write(to: tempFile)
 
-        let settings = AgentBoxSettings(
-            managerModel: "anthropic sonnet",
-            workerModel: "google gemini",
-            pollingIntervalSeconds: 900,
-            inboxPath: "/tmp",
-            processingPath: "/tmp",
-            completedPath: "/tmp",
-            pythonExecutable: "/usr/bin/python3"
-        )
-        let keys = APIKeys(claude: "", gemini: "", minimax: "", codex: "")
+        var settings = AgentBoxSettings.defaultValue()
+        settings.useCLIMode = false
+        settings.managerModelId = "anthropic sonnet"
+        settings.workerModelId = "google gemini"
+        settings.inboxPath = "/tmp"
+        settings.processingPath = "/tmp"
+        settings.completedPath = "/tmp"
+        let keys = APIKeys(claude: "", gemini: "", minimax: "", codex: "", openai: "")
 
         let runner = PythonRunner()
         let plan = try await runner.generatePlan(inputFile: tempFile, settings: settings, keys: keys)
@@ -134,16 +127,14 @@ final class AgentBoxTests: XCTestCase {
             .appendingPathComponent("AgentBoxBridgeError_\(UUID().uuidString).txt")
         try Data("Need a lunch plan.".utf8).write(to: tempFile)
 
-        let settings = AgentBoxSettings(
-            managerModel: "anthropic sonnet",
-            workerModel: "codex",
-            pollingIntervalSeconds: 900,
-            inboxPath: "/tmp",
-            processingPath: "/tmp",
-            completedPath: "/tmp",
-            pythonExecutable: "/usr/bin/python3"
-        )
-        let keys = APIKeys(claude: "", gemini: "", minimax: "", codex: "")
+        var settings = AgentBoxSettings.defaultValue()
+        settings.useCLIMode = false
+        settings.managerModelId = "anthropic sonnet"
+        settings.workerModelId = "codex"
+        settings.inboxPath = "/tmp"
+        settings.processingPath = "/tmp"
+        settings.completedPath = "/tmp"
+        let keys = APIKeys(claude: "", gemini: "", minimax: "", codex: "", openai: "")
 
         let runner = PythonRunner()
 

@@ -9,6 +9,7 @@ enum CLIRunnerError: Error, LocalizedError {
     case invalidResponse(String)
     case timeout
     case modelNotAvailable(String)
+    case agentNotAvailable(String)
 
     var errorDescription: String? {
         switch self {
@@ -24,6 +25,39 @@ enum CLIRunnerError: Error, LocalizedError {
             return "CLI execution timed out"
         case .modelNotAvailable(let model):
             return "Model not available: \(model)"
+        case .agentNotAvailable(let agent):
+            return "Agent not available: \(agent)"
+        }
+    }
+}
+
+// MARK: - Agent Availability
+
+struct AgentAvailability {
+    var claude: Bool = false
+    var codex: Bool = false
+    var gemini: Bool = false
+    var ollama: Bool = false
+    var minimax: Bool = false
+
+    var availableAgents: [String] {
+        var agents: [String] = []
+        if claude { agents.append("claude") }
+        if codex { agents.append("codex") }
+        if gemini { agents.append("gemini") }
+        if ollama { agents.append("ollama") }
+        if minimax { agents.append("minimax") }
+        return agents
+    }
+
+    func isAvailable(_ agent: String) -> Bool {
+        switch agent.lowercased() {
+        case "claude": return claude
+        case "codex": return codex
+        case "gemini": return gemini
+        case "ollama": return ollama
+        case "minimax": return minimax
+        default: return claude // fallback to claude
         }
     }
 }
@@ -33,7 +67,111 @@ enum CLIRunnerError: Error, LocalizedError {
 actor CLIRunner {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
-    private let timeout: TimeInterval = 120
+    private let timeout: TimeInterval = 180
+    private var cachedAvailability: AgentAvailability?
+
+    // MARK: - Orchestration Script Support
+
+    /// Check if orchestration script is configured and available
+    func isOrchestrationScriptAvailable(settings: AgentBoxSettings) -> Bool {
+        guard settings.useOrchestrateScript,
+              !settings.orchestrateScriptPath.isEmpty else {
+            return false
+        }
+        return FileManager.default.fileExists(atPath: settings.orchestrateScriptPath)
+    }
+
+    /// Run orchestration script and return output
+    private func runOrchestrationScript(arguments: [String], settings: AgentBoxSettings) async throws -> String {
+        let scriptPath = settings.orchestrateScriptPath
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath] + arguments
+
+        // Set environment variables from settings
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "CLAUDECODE")
+        env["CLAUDE_CLI"] = settings.claudeCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/claude"
+        env["CODEX_CLI"] = settings.codexCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/codex"
+        env["GEMINI_CLI"] = settings.geminiCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/gemini"
+        env["OLLAMA_CLI"] = settings.ollamaCLICommand.split(separator: " ").first.map(String.init) ?? "/usr/local/bin/ollama"
+        env["OLLAMA_MODEL"] = settings.ollamaModelName
+        env["MINIMAX_BASE_URL"] = settings.minimaxBaseURL
+        env["MINIMAX_AUTH_TOKEN"] = settings.minimaxAuthToken
+        env["MINIMAX_MODEL"] = settings.minimaxModelName
+        process.environment = env
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+        try await waitForProcess(process, timeout: timeout)
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+
+        if process.terminationStatus != 0 && stdoutText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let errorMsg = stderrText.isEmpty ? "Exit code: \(process.terminationStatus)" : stderrText
+            throw CLIRunnerError.processFailed(errorMsg)
+        }
+
+        return stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Run orchestration script with stdin input
+    private func runOrchestrationScriptWithStdin(arguments: [String], stdinInput: String, settings: AgentBoxSettings) async throws -> String {
+        let scriptPath = settings.orchestrateScriptPath
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [scriptPath] + arguments
+
+        // Set environment variables from settings
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "CLAUDECODE")
+        env["CLAUDE_CLI"] = settings.claudeCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/claude"
+        env["CODEX_CLI"] = settings.codexCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/codex"
+        env["GEMINI_CLI"] = settings.geminiCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/gemini"
+        env["OLLAMA_CLI"] = settings.ollamaCLICommand.split(separator: " ").first.map(String.init) ?? "/usr/local/bin/ollama"
+        env["OLLAMA_MODEL"] = settings.ollamaModelName
+        env["MINIMAX_BASE_URL"] = settings.minimaxBaseURL
+        env["MINIMAX_AUTH_TOKEN"] = settings.minimaxAuthToken
+        env["MINIMAX_MODEL"] = settings.minimaxModelName
+        process.environment = env
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+
+        // Write stdin input
+        stdinPipe.fileHandleForWriting.write(stdinInput.data(using: .utf8)!)
+        stdinPipe.fileHandleForWriting.closeFile()
+
+        try await waitForProcess(process, timeout: timeout)
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+
+        if process.terminationStatus != 0 && stdoutText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let errorMsg = stderrText.isEmpty ? "Exit code: \(process.terminationStatus)" : stderrText
+            throw CLIRunnerError.processFailed(errorMsg)
+        }
+
+        return stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     // MARK: - Public API
 
@@ -78,11 +216,133 @@ actor CLIRunner {
         return resultText
     }
 
+    // MARK: - Agent Validation
+
+    /// Check which agents are available (mirrors orchestrate.sh check_prereqs)
+    func checkAgentAvailability(settings: AgentBoxSettings) async -> AgentAvailability {
+        // Return cached if recent
+        if let cached = cachedAvailability {
+            return cached
+        }
+
+        // Check if we should use the orchestration script for availability check
+        if isOrchestrationScriptAvailable(settings: settings) {
+            return await checkAgentAvailabilityViaScript(settings: settings)
+        }
+
+        var availability = AgentAvailability()
+
+        // Check Claude CLI
+        let claudePath = settings.claudeCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/claude"
+        if FileManager.default.fileExists(atPath: claudePath) {
+            availability.claude = true
+        }
+
+        // Check Codex CLI
+        let codexPath = settings.codexCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/codex"
+        if FileManager.default.fileExists(atPath: codexPath) {
+            availability.codex = true
+        }
+
+        // Check Gemini CLI
+        let geminiPath = settings.geminiCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/gemini"
+        if FileManager.default.fileExists(atPath: geminiPath) {
+            availability.gemini = true
+        }
+
+        // Check Ollama
+        let ollamaPath = settings.ollamaCLICommand.split(separator: " ").first.map(String.init) ?? "/usr/local/bin/ollama"
+        if FileManager.default.fileExists(atPath: ollamaPath) {
+            // Check if model is available
+            do {
+                let listOutput = try await runShellCommand("\(ollamaPath) list", timeout: 30)
+                let modelName = settings.ollamaModelName.isEmpty ? "llama3" : settings.ollamaModelName
+                if listOutput.contains(modelName) || listOutput.contains("\(modelName):") {
+                    availability.ollama = true
+                }
+            } catch {
+                // Ollama not available
+            }
+        }
+
+        // Check MiniMax (requires claude CLI + auth token)
+        if availability.claude && !settings.minimaxAuthToken.isEmpty {
+            availability.minimax = true
+        }
+
+        cachedAvailability = availability
+        return availability
+    }
+
+    /// Check agent availability via orchestrate.sh script
+    private func checkAgentAvailabilityViaScript(settings: AgentBoxSettings) async -> AgentAvailability {
+        do {
+            let output = try await runOrchestrationScript(
+                arguments: ["check_prereqs"],
+                settings: settings
+            )
+
+            // Parse JSON output
+            guard let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return AgentAvailability()
+            }
+
+            var availability = AgentAvailability()
+            availability.claude = json["claude"] as? Bool ?? false
+            availability.codex = json["codex"] as? Bool ?? false
+            availability.gemini = json["gemini"] as? Bool ?? false
+            availability.ollama = json["ollama"] as? Bool ?? false
+            availability.minimax = json["minimax"] as? Bool ?? false
+
+            cachedAvailability = availability
+            return availability
+        } catch {
+            return AgentAvailability()
+        }
+    }
+
+    /// Get fallback agent if requested agent is not available
+    func getFallbackAgent(for agent: String, availability: AgentAvailability) -> String {
+        if availability.isAvailable(agent) {
+            return agent
+        }
+
+        // Try fallback hierarchy
+        if availability.claude {
+            return "claude"
+        }
+        if availability.ollama {
+            return "ollama"
+        }
+
+        return "claude" // ultimate fallback
+    }
+
     // MARK: - Orchestration API
 
     /// Phase 1: Call the manager CLI to generate a JSON execution plan (mirrors orchestrate.sh plan_task).
     func generateOrchestrationPlan(instruction: String, settings: AgentBoxSettings) async throws -> OrchestratorPlan {
+        // Check if we should use the orchestration script
+        if isOrchestrationScriptAvailable(settings: settings) {
+            return try await generateOrchestrationPlanViaScript(instruction: instruction, settings: settings)
+        }
+
+        // Use native Swift implementation
         let ollamaModel = settings.ollamaModelName.isEmpty ? "llama3" : settings.ollamaModelName
+
+        // Get project context if set
+        var projectContext = ""
+        if !settings.projectDirectory.isEmpty && FileManager.default.fileExists(atPath: settings.projectDirectory) {
+            projectContext = """
+
+            Project directory: \(settings.projectDirectory)
+            NOTE: Agents that need to read/write files MUST set "needs_files": true in their subtask JSON.
+                  Claude and minimax agents with needs_files=true will run in agentic mode (can read/write files).
+                  Ollama cannot access files — only assign text/analysis tasks to it.
+            """
+        }
+
         let prompt = """
         IMPORTANT: Respond ONLY with valid JSON, no markdown fences, no explanation.
 
@@ -92,10 +352,11 @@ actor CLIRunner {
         - claude: Best for complex reasoning, architecture, code review, file editing, implementation
         - codex: Best for code generation, refactoring, implementation
         - gemini: Best for research, documentation, broad knowledge tasks
-        - ollama (local/\(ollamaModel)): Best for simple text tasks, summarization, formatting
-        - minimax: Best for creative tasks, multilingual content, alternative perspective
+        - ollama (local/\(ollamaModel)): Best for simple text tasks, summarization, formatting (NO file access)
+        - minimax (kimi-k2.5): Best for creative tasks, multilingual content, alternative perspective, file editing
 
         Task: \(instruction)
+        \(projectContext)
 
         Respond ONLY with valid JSON in this exact structure (no markdown, no backticks):
         {
@@ -115,8 +376,9 @@ actor CLIRunner {
         }
         """
 
-        let output = try await runCustomCLI(command: settings.claudeCLICommand, prompt: prompt, modelId: "claude-cli", mode: "plan", settings: settings)
-        let raw = output.plan ?? output.result ?? ""
+        // Use stdin for planning (mirrors orchestrate.sh)
+        let output = try await runCLIClaudeWithStdin(prompt: prompt, settings: settings, mode: "plan")
+        let raw = output
 
         // Strip markdown fences if present
         let cleaned = raw
@@ -142,9 +404,53 @@ actor CLIRunner {
         }
     }
 
+    /// Generate orchestration plan via orchestrate.sh script
+    private func generateOrchestrationPlanViaScript(instruction: String, settings: AgentBoxSettings) async throws -> OrchestratorPlan {
+        // Write instruction to temp file
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempFile = tempDir.appendingPathComponent("orchestrate_plan_\(UUID().uuidString).txt")
+        try instruction.write(to: tempFile, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tempFile) }
+
+        let output = try await runOrchestrationScript(
+            arguments: ["plan_task", tempFile.path],
+            settings: settings
+        )
+
+        // Clean output - remove markdown fences
+        let cleaned = output
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Extract JSON object boundaries
+        guard let startIdx = cleaned.firstIndex(of: "{"),
+              let endIdx = cleaned.lastIndex(of: "}") else {
+            throw CLIRunnerError.invalidResponse("No JSON object found in plan response")
+        }
+
+        let jsonString = String(cleaned[startIdx...endIdx])
+        guard let data = jsonString.data(using: .utf8) else {
+            throw CLIRunnerError.invalidResponse("Could not encode plan JSON as UTF-8")
+        }
+
+        do {
+            return try JSONDecoder().decode(OrchestratorPlan.self, from: data)
+        } catch {
+            throw CLIRunnerError.invalidResponse("Could not decode orchestration plan: \(error.localizedDescription)")
+        }
+    }
+
     /// Phase 2: Execute a single subtask with the assigned agent (mirrors orchestrate.sh run_*_agent).
     /// Injects context from dependency results if provided.
-    func executeSubtask(_ subtask: OrchestratorSubtask, previousResults: [String: String], settings: AgentBoxSettings) async throws -> String {
+    /// Returns (result, error) - error is non-nil if subtask failed but orchestration should continue
+    func executeSubtask(_ subtask: OrchestratorSubtask, previousResults: [String: String], settings: AgentBoxSettings) async -> (result: String?, error: Error?) {
+        // Check if we should use the orchestration script
+        if isOrchestrationScriptAvailable(settings: settings) {
+            return await executeSubtaskViaScript(subtask, previousResults: previousResults, settings: settings)
+        }
+
+        // Use native Swift implementation
         let description: String
         if !subtask.dependsOn.isEmpty {
             let depContext = subtask.dependsOn
@@ -160,11 +466,69 @@ actor CLIRunner {
             description = subtask.description
         }
 
-        return try await dispatchToAgent(subtask.agent, description: description, settings: settings)
+        // Check agent availability and get fallback if needed
+        let availability = await checkAgentAvailability(settings: settings)
+        let agent = getFallbackAgent(for: subtask.agent, availability: availability)
+
+        do {
+            let result = try await dispatchToAgent(agent, description: description, needsFiles: subtask.needsFiles, settings: settings)
+            return (result, nil)
+        } catch {
+            // Return error but don't throw - allows orchestration to continue
+            return (nil, error)
+        }
+    }
+
+    /// Execute subtask via orchestrate.sh script
+    private func executeSubtaskViaScript(_ subtask: OrchestratorSubtask, previousResults: [String: String], settings: AgentBoxSettings) async -> (result: String?, error: Error?) {
+        // Build subtask JSON
+        var subtaskJson: [String: Any] = [
+            "id": subtask.id,
+            "agent": subtask.agent,
+            "description": subtask.description,
+            "needs_files": subtask.needsFiles,
+            "project_directory": settings.projectDirectory
+        ]
+
+        // Add depends_on as array
+        if !subtask.dependsOn.isEmpty {
+            subtaskJson["depends_on"] = subtask.dependsOn
+        }
+
+        guard let subtaskData = try? JSONSerialization.data(withJSONObject: subtaskJson),
+              let subtaskString = String(data: subtaskData, encoding: .utf8) else {
+            return (nil, CLIRunnerError.invalidResponse("Could not serialize subtask JSON"))
+        }
+
+        // Serialize previous results
+        var prevResultsJson: [String: String] = [:]
+        if !previousResults.isEmpty {
+            prevResultsJson = previousResults
+        }
+
+        let prevResultsData = try? JSONSerialization.data(withJSONObject: prevResultsJson)
+        let prevResultsString = prevResultsData.flatMap { String(data: $0, encoding: .utf8) } ?? "null"
+
+        do {
+            let output = try await runOrchestrationScriptWithStdin(
+                arguments: ["run_agent", subtaskString, prevResultsString],
+                stdinInput: "",
+                settings: settings
+            )
+            return (output, nil)
+        } catch {
+            return (nil, error)
+        }
     }
 
     /// Phase 3: Consolidate all subtask results into a final report (mirrors orchestrate.sh consolidate).
     func consolidateResults(originalTask: String, plan: OrchestratorPlan, taskResults: [String: String], settings: AgentBoxSettings) async throws -> String {
+        // Check if we should use the orchestration script
+        if isOrchestrationScriptAvailable(settings: settings) {
+            return try await consolidateResultsViaScript(originalTask: originalTask, plan: plan, taskResults: taskResults, settings: settings)
+        }
+
+        // Use native Swift implementation
         let allResults = plan.subtasks
             .compactMap { subtask -> String? in
                 guard let result = taskResults[subtask.id] else { return nil }
@@ -192,96 +556,204 @@ actor CLIRunner {
         Format your response as clean Markdown.
         """
 
-        let output = try await runCustomCLI(command: settings.claudeCLICommand, prompt: prompt, modelId: "claude-cli", mode: "execute", settings: settings)
-        return output.result ?? output.plan ?? ""
+        // Use stdin for consolidation (mirrors orchestrate.sh)
+        return try await runCLIClaudeWithStdin(prompt: prompt, settings: settings, mode: "execute")
     }
 
-    /// Dispatch a prompt to the named agent type, falling back to claude on unknown agents.
-    private func dispatchToAgent(_ agent: String, description: String, settings: AgentBoxSettings) async throws -> String {
+    /// Consolidate results via orchestrate.sh script
+    private func consolidateResultsViaScript(originalTask: String, plan: OrchestratorPlan, taskResults: [String: String], settings: AgentBoxSettings) async throws -> String {
+        // Serialize plan and results
+        let planData = try JSONEncoder().encode(plan)
+        let planString = String(data: planData, encoding: .utf8) ?? "{}"
+
+        let resultsData = try JSONSerialization.data(withJSONObject: taskResults)
+        let resultsString = String(data: resultsData, encoding: .utf8) ?? "{}"
+
+        let output = try await runOrchestrationScriptWithStdin(
+            arguments: ["consolidate", originalTask, planString, resultsString],
+            stdinInput: "",
+            settings: settings
+        )
+
+        return output
+    }
+
+    /// Dispatch a prompt to the named agent type with needsFiles handling (mirrors orchestrate.sh).
+    /// When needsFiles=true and projectDirectory is set, runs in agentic mode with file access.
+    private func dispatchToAgent(_ agent: String, description: String, needsFiles: Bool, settings: AgentBoxSettings) async throws -> String {
         switch agent.lowercased() {
         case "codex":
-            let out = try await runCustomCLI(command: settings.codexCLICommand, prompt: description, modelId: "codex-cli", mode: "execute", settings: settings)
-            return out.result ?? ""
+            return try await runCodexAgent(description: description, needsFiles: needsFiles, settings: settings)
         case "gemini":
-            let out = try await runCustomCLI(command: settings.geminiCLICommand, prompt: description, modelId: "gemini-cli", mode: "execute", settings: settings)
-            return out.result ?? ""
+            return try await runGeminiAgent(description: description, needsFiles: needsFiles, settings: settings)
         case "ollama":
-            let out = try await runOllama(modelId: settings.ollamaModelName, mode: "execute", instruction: description, settings: settings)
-            return out.result ?? ""
+            return try await runOllamaAgent(description: description, settings: settings)
         case "minimax":
-            let out = try await runCustomCLI(command: settings.minimaxCLICommand, prompt: description, modelId: "minimax-cli", mode: "execute", settings: settings)
-            return out.result ?? ""
-        default: // "claude" and any unknown agent — fall back to claude
-            let out = try await runCustomCLI(command: settings.claudeCLICommand, prompt: description, modelId: "claude-cli", mode: "execute", settings: settings)
-            return out.result ?? ""
+            return try await runMinimaxAgent(description: description, needsFiles: needsFiles, settings: settings)
+        default: // "claude" and any unknown agent
+            return try await runClaudeAgent(description: description, needsFiles: needsFiles, settings: settings)
         }
     }
 
-    // MARK: - Private Execution
+    // MARK: - Agent Implementations (matching orchestrate.sh patterns)
 
-    private func executeWithModel(modelId: String, workerModelId: String? = nil, mode: String, instruction: String, settings: AgentBoxSettings) async throws -> AgentBridgeOutput {
-        // Parse model identifier
-        let (provider, actualModelId) = parseModelIdentifier(modelId)
+    /// Run Claude agent - supports both print mode (stdin) and agentic mode (file access)
+    private func runClaudeAgent(description: String, needsFiles: Bool, settings: AgentBoxSettings) async throws -> String {
+        let projectDir = settings.projectDirectory
+        let hasProjectDir = !projectDir.isEmpty && FileManager.default.fileExists(atPath: projectDir)
 
-        switch provider {
-        case .claudeCLI:
-            return try await runCustomCLI(command: settings.claudeCLICommand, prompt: instruction, modelId: modelId, mode: mode, settings: settings)
-        case .codexCLI:
-            return try await runCustomCLI(command: settings.codexCLICommand, prompt: instruction, modelId: modelId, mode: mode, settings: settings)
-        case .geminiCLI:
-            return try await runCustomCLI(command: settings.geminiCLICommand, prompt: instruction, modelId: modelId, mode: mode, settings: settings)
-        case .minimaxCLI:
-            return try await runCustomCLI(command: settings.minimaxCLICommand, prompt: instruction, modelId: modelId, mode: mode, settings: settings)
-        case .ollama:
-            return try await runOllama(modelId: actualModelId, mode: mode, instruction: instruction, settings: settings)
-        case .anthropic, .google, .openai, .minimax:
-            // These use the Python bridge for API calls
-            throw CLIRunnerError.invalidResponse("API-based models require Python bridge. Use CLI models instead.")
+        if needsFiles && hasProjectDir {
+            // Agentic mode: run WITHOUT --print for tool access (mirrors orchestrate.sh)
+            let cliPath = settings.claudeCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/claude"
+            let result = try await runProcessWithAgenticMode(
+                executable: cliPath,
+                arguments: ["--dangerously-skip-permissions", "--no-session-persistence", description],
+                workingDirectory: projectDir,
+                timeout: timeout
+            )
+            return result
+        } else {
+            // Print mode: text only via stdin (mirrors orchestrate.sh)
+            return try await runCLIClaudeWithStdin(prompt: description, settings: settings, mode: "execute")
         }
     }
 
-    // MARK: - CLI Implementations
+    /// Run MiniMax agent - uses Claude CLI with env overrides (mirrors orchestrate.sh)
+    private func runMinimaxAgent(description: String, needsFiles: Bool, settings: AgentBoxSettings) async throws -> String {
+        let cliPath = settings.claudeCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/claude"
+        let projectDir = settings.projectDirectory
+        let hasProjectDir = !projectDir.isEmpty && FileManager.default.fileExists(atPath: projectDir)
 
-    private func runCustomCLI(command: String, prompt: String, modelId: String, mode: String, settings: AgentBoxSettings) async throws -> AgentBridgeOutput {
-        let startTime = Date()
-
-        // Replace {PROMPT} placeholder with the actual prompt
-        // Quote the prompt to handle spaces and special characters
-        let quotedPrompt = prompt.replacingOccurrences(of: "\"", with: "\\\"")
-        let processedCommand = command.replacingOccurrences(of: "{PROMPT}", with: "\"\(quotedPrompt)\"")
-
-        // Always use shell to execute - it's more reliable for complex CLI commands
-        let output = try await runShellCommand(processedCommand, timeout: 180)
-        let executionTime = Date().timeIntervalSince(startTime)
-
-        let cleanOutput = stripANSI(output).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Return plan or result depending on mode
-        if mode == "plan" {
-            return AgentBridgeOutput(
-                plan: cleanOutput,
-                result: nil,
-                error: cleanOutput.isEmpty ? "Empty response from CLI" : nil,
-                modelUsed: modelId,
-                executionTime: executionTime
+        if needsFiles && hasProjectDir {
+            // Agentic mode with env overrides
+            return try await runProcessWithAgenticModeAndEnv(
+                executable: cliPath,
+                arguments: [
+                    "--dangerously-skip-permissions",
+                    "--no-session-persistence",
+                    "--model", settings.minimaxModelName,
+                    description
+                ],
+                workingDirectory: projectDir,
+                timeout: timeout,
+                envOverrides: [
+                    "ANTHROPIC_BASE_URL": settings.minimaxBaseURL,
+                    "ANTHROPIC_AUTH_TOKEN": settings.minimaxAuthToken
+                ]
             )
         } else {
-            return AgentBridgeOutput(
-                plan: nil,
-                result: cleanOutput,
-                error: cleanOutput.isEmpty ? "Empty response from CLI" : nil,
-                modelUsed: modelId,
-                executionTime: executionTime
+            // Print mode with env overrides (mirrors orchestrate.sh)
+            return try await runCLIWithStdinAndEnv(
+                executable: cliPath,
+                arguments: ["--print", "--model", settings.minimaxModelName],
+                prompt: description,
+                timeout: timeout,
+                envOverrides: [
+                    "ANTHROPIC_BASE_URL": settings.minimaxBaseURL,
+                    "ANTHROPIC_AUTH_TOKEN": settings.minimaxAuthToken
+                ]
             )
         }
     }
 
-    private func runProcessWithStdin(executable: String, arguments: [String], input: String, timeout: TimeInterval) async throws -> String {
+    /// Run Codex agent
+    private func runCodexAgent(description: String, needsFiles: Bool, settings: AgentBoxSettings) async throws -> String {
+        let cliPath = settings.codexCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/codex"
+        let projectDir = settings.projectDirectory
+        let hasProjectDir = !projectDir.isEmpty && FileManager.default.fileExists(atPath: projectDir)
+
+        if needsFiles && hasProjectDir {
+            // Run in project directory
+            return try await runCLIWithStdin(
+                executable: cliPath,
+                arguments: ["--quiet"],
+                prompt: description,
+                timeout: timeout,
+                workingDirectory: projectDir
+            )
+        } else {
+            // Print mode via stdin
+            return try await runCLIWithStdin(
+                executable: cliPath,
+                arguments: ["--quiet"],
+                prompt: description,
+                timeout: timeout
+            )
+        }
+    }
+
+    /// Run Gemini agent
+    private func runGeminiAgent(description: String, needsFiles: Bool, settings: AgentBoxSettings) async throws -> String {
+        let cliPath = settings.geminiCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/gemini"
+        let projectDir = settings.projectDirectory
+        let hasProjectDir = !projectDir.isEmpty && FileManager.default.fileExists(atPath: projectDir)
+
+        if needsFiles && hasProjectDir {
+            // Run in project directory
+            return try await runCLIWithStdin(
+                executable: cliPath,
+                arguments: [],
+                prompt: description,
+                timeout: timeout,
+                workingDirectory: projectDir
+            )
+        } else {
+            // Print mode via stdin
+            return try await runCLIWithStdin(
+                executable: cliPath,
+                arguments: [],
+                prompt: description,
+                timeout: timeout
+            )
+        }
+    }
+
+    /// Run Ollama agent (no file access - text only)
+    private func runOllamaAgent(description: String, settings: AgentBoxSettings) async throws -> String {
+        let cliPath = settings.ollamaCLICommand.split(separator: " ").first.map(String.init) ?? "/usr/local/bin/ollama"
+        let modelName = settings.ollamaModelName.isEmpty ? "llama3" : settings.ollamaModelName
+
+        // Check if model is available
+        let listOutput = try await runShellCommand("\(cliPath) list", timeout: 30)
+        if !listOutput.contains(modelName) && !listOutput.contains("\(modelName):") {
+            // Try to pull the model
+            _ = try await runShellCommand("\(cliPath) pull \(modelName)", timeout: 300)
+        }
+
+        // Use stdin (mirrors orchestrate.sh)
+        return try await runCLIWithStdin(
+            executable: cliPath,
+            arguments: ["run", modelName],
+            prompt: description,
+            timeout: timeout
+        )
+    }
+
+    // MARK: - Private Execution Helpers
+
+    /// Run Claude CLI with stdin (mirrors orchestrate.sh pattern)
+    private func runCLIClaudeWithStdin(prompt: String, settings: AgentBoxSettings, mode: String) async throws -> String {
+        let cliPath = settings.claudeCLICommand.split(separator: " ").first.map(String.init) ?? "/opt/homebrew/bin/claude"
+        return try await runCLIWithStdin(
+            executable: cliPath,
+            arguments: ["--print"],
+            prompt: prompt,
+            timeout: timeout
+        )
+    }
+
+    /// Run CLI with stdin input (matches orchestrate.sh < prompt_file pattern)
+    private func runCLIWithStdin(executable: String, arguments: [String], prompt: String, timeout: TimeInterval, workingDirectory: String? = nil) async throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
 
-        // Clean environment to avoid conflicts (e.g., CLAUDECODE)
+        // Set working directory if specified
+        if let workDir = workingDirectory {
+            process.currentDirectoryURL = URL(fileURLWithPath: workDir)
+        }
+
+        // Clean environment
         var env = ProcessInfo.processInfo.environment
         env.removeValue(forKey: "CLAUDECODE")
         process.environment = env
@@ -296,11 +768,152 @@ actor CLIRunner {
 
         try process.run()
 
-        // Write input to stdin
-        stdinPipe.fileHandleForWriting.write(input.data(using: .utf8)!)
+        // Write prompt to stdin
+        stdinPipe.fileHandleForWriting.write(prompt.data(using: .utf8)!)
         stdinPipe.fileHandleForWriting.closeFile()
 
         // Wait with timeout
+        try await waitForProcess(process, timeout: timeout)
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+
+        // Check for errors - but allow non-zero exit if we got output
+        if process.terminationStatus != 0 && stdoutText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let errorMsg = stderrText.isEmpty ? "Exit code: \(process.terminationStatus)" : stderrText
+            throw CLIRunnerError.processFailed(errorMsg)
+        }
+
+        return stripANSI(stdoutText).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Run CLI with stdin and environment overrides
+    private func runCLIWithStdinAndEnv(executable: String, arguments: [String], prompt: String, timeout: TimeInterval, envOverrides: [String: String]) async throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+
+        // Apply env overrides
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "CLAUDECODE")
+        for (key, value) in envOverrides {
+            env[key] = value
+        }
+        process.environment = env
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+
+        // Write prompt to stdin
+        stdinPipe.fileHandleForWriting.write(prompt.data(using: .utf8)!)
+        stdinPipe.fileHandleForWriting.closeFile()
+
+        // Wait with timeout
+        try await waitForProcess(process, timeout: timeout)
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+
+        if process.terminationStatus != 0 && stdoutText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let errorMsg = stderrText.isEmpty ? "Exit code: \(process.terminationStatus)" : stderrText
+            throw CLIRunnerError.processFailed(errorMsg)
+        }
+
+        return stripANSI(stdoutText).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Run process in agentic mode (no --print, with tool access)
+    private func runProcessWithAgenticMode(executable: String, arguments: [String], workingDirectory: String, timeout: TimeInterval) async throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
+
+        // Clean environment
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "CLAUDECODE")
+        process.environment = env
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+
+        // Wait with timeout
+        try await waitForProcess(process, timeout: timeout)
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+
+        if process.terminationStatus != 0 && stdoutText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let errorMsg = stderrText.isEmpty ? "Exit code: \(process.terminationStatus)" : stderrText
+            throw CLIRunnerError.processFailed(errorMsg)
+        }
+
+        return stripANSI(stdoutText).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Run process in agentic mode with env overrides
+    private func runProcessWithAgenticModeAndEnv(executable: String, arguments: [String], workingDirectory: String, timeout: TimeInterval, envOverrides: [String: String]) async throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
+
+        // Apply env overrides
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "CLAUDECODE")
+        for (key, value) in envOverrides {
+            env[key] = value
+        }
+        process.environment = env
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        try process.run()
+
+        // Wait with timeout
+        try await waitForProcess(process, timeout: timeout)
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+
+        if process.terminationStatus != 0 && stdoutText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let errorMsg = stderrText.isEmpty ? "Exit code: \(process.terminationStatus)" : stderrText
+            throw CLIRunnerError.processFailed(errorMsg)
+        }
+
+        return stripANSI(stdoutText).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Wait for process with timeout
+    private func waitForProcess(_ process: Process, timeout: TimeInterval) async throws {
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
                 process.waitUntilExit()
@@ -315,95 +928,43 @@ actor CLIRunner {
             try await group.next()
             group.cancelAll()
         }
-
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-
-        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
-        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
-
-        guard process.terminationStatus == 0 else {
-            if !stderrText.isEmpty {
-                throw CLIRunnerError.processFailed(stderrText)
-            }
-            throw CLIRunnerError.processFailed("Exit code: \(process.terminationStatus)")
-        }
-
-        return stdoutText
     }
 
-    private func runOllama(modelId: String, mode: String, instruction: String, settings: AgentBoxSettings) async throws -> AgentBridgeOutput {
-        let ollamaCommand = settings.ollamaCLICommand
-        let actualModel = settings.ollamaModelName.isEmpty ? "llama3" : settings.ollamaModelName
+    // MARK: - Legacy Support (for non-orchestration use)
 
-        // First check if model is available
-        let listOutput = try await runShellCommand("\(ollamaCommand) list", timeout: 30)
-        if !listOutput.contains(actualModel) && !listOutput.contains("\(actualModel):") {
-            // Try to pull the model
-            _ = try await runShellCommand("\(ollamaCommand) pull \(actualModel)", timeout: 300)
-        }
+    private func executeWithModel(modelId: String, workerModelId: String? = nil, mode: String, instruction: String, settings: AgentBoxSettings) async throws -> AgentBridgeOutput {
+        // Parse model identifier
+        let (provider, actualModelId) = parseModelIdentifier(modelId)
 
-        let prompt: String
-        if mode == "plan" {
-            prompt = """
-            You are the AgentBox manager model. Create an execution plan.
-
-            Return markdown with:
-            1) Mission Understanding
-            2) Work Breakdown
-            3) Validation Plan
-            4) Risks and Mitigations
-            5) Output Contract
-
-            Instruction: \(instruction)
-            """
-        } else {
-            prompt = instruction
-        }
-
-        let startTime = Date()
-        // Use printf instead of echo for better portability and handling of special characters
-        // Use sed to strip ANSI codes reliably in the shell
-        let sedCommand = #"sed -E 's/\x1B//g; s/\[(\?|[0-9])[0-9;]*[A-Za-z]?//g; s/\[K//g'"#
-        // Use printf %s for safe handling of prompt content
-        let fullCommand = "printf '%s' \"\(prompt.replacingOccurrences(of: "\"", with: "\\\""))\" | \(ollamaCommand) run \(actualModel) 2>&1 | \(sedCommand)"
-        let output = try await runShellCommand(fullCommand, timeout: 180)
-        let executionTime = Date().timeIntervalSince(startTime)
-
-        // Debug: Log output length if empty
-        if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            print("[CLIRunner] Warning: Empty output from ollama for mode: \(mode)")
-        }
-
-        if mode == "plan" {
-            let cleanedOutput = stripANSI(output).trimmingCharacters(in: .whitespacesAndNewlines)
-            return AgentBridgeOutput(
-                plan: cleanedOutput.isEmpty ? nil : cleanedOutput,
-                result: nil,
-                error: cleanedOutput.isEmpty ? "Empty response from model" : nil,
-                modelUsed: "ollama/\(actualModel)",
-                executionTime: executionTime
-            )
-        } else {
-            let cleanedOutput = stripANSI(output).trimmingCharacters(in: .whitespacesAndNewlines)
-            return AgentBridgeOutput(
-                plan: nil,
-                result: cleanedOutput.isEmpty ? nil : cleanedOutput,
-                error: cleanedOutput.isEmpty ? "Empty response from model" : nil,
-                modelUsed: "ollama/\(actualModel)",
-                executionTime: executionTime
-            )
+        switch provider {
+        case .claudeCLI:
+            let result = try await runCLIClaudeWithStdin(prompt: instruction, settings: settings, mode: mode)
+            return AgentBridgeOutput(plan: mode == "plan" ? result : nil, result: mode != "plan" ? result : nil, error: nil, modelUsed: modelId, executionTime: 0)
+        case .codexCLI:
+            let result = try await runCodexAgent(description: instruction, needsFiles: false, settings: settings)
+            return AgentBridgeOutput(plan: nil, result: result, error: nil, modelUsed: modelId, executionTime: 0)
+        case .geminiCLI:
+            let result = try await runGeminiAgent(description: instruction, needsFiles: false, settings: settings)
+            return AgentBridgeOutput(plan: nil, result: result, error: nil, modelUsed: modelId, executionTime: 0)
+        case .minimaxCLI:
+            let result = try await runMinimaxAgent(description: instruction, needsFiles: false, settings: settings)
+            return AgentBridgeOutput(plan: nil, result: result, error: nil, modelUsed: modelId, executionTime: 0)
+        case .ollama:
+            let result = try await runOllamaAgent(description: instruction, settings: settings)
+            return AgentBridgeOutput(plan: nil, result: result, error: nil, modelUsed: "ollama/\(actualModelId)", executionTime: 0)
+        case .anthropic, .google, .openai, .minimax:
+            throw CLIRunnerError.invalidResponse("API-based models require Python bridge. Use CLI models instead.")
         }
     }
 
-    // MARK: - Helper Methods
+    // MARK: - Shell Command (for simple commands)
 
     private func runShellCommand(_ command: String, timeout: TimeInterval) async throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = ["-c", command]
 
-        // Clean environment to avoid conflicts (e.g., CLAUDECODE)
+        // Clean environment
         var env = ProcessInfo.processInfo.environment
         env.removeValue(forKey: "CLAUDECODE")
         process.environment = env
@@ -416,20 +977,7 @@ actor CLIRunner {
         try process.run()
 
         // Wait with timeout
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                process.waitUntilExit()
-            }
-
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                process.terminate()
-                throw CLIRunnerError.timeout
-            }
-
-            try await group.next()
-            group.cancelAll()
-        }
+        try await waitForProcess(process, timeout: timeout)
 
         let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
         let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
@@ -445,54 +993,7 @@ actor CLIRunner {
         return stdoutText
     }
 
-    private func runProcess(executable: String, arguments: [String], timeout: TimeInterval) async throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-
-        // Clean environment to avoid conflicts (e.g., CLAUDECODE)
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: "CLAUDECODE")
-        process.environment = env
-
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        try process.run()
-
-        // Wait with timeout
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                process.waitUntilExit()
-            }
-
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                process.terminate()
-                throw CLIRunnerError.timeout
-            }
-
-            try await group.next()
-            group.cancelAll()
-        }
-
-        let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
-
-        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? ""
-        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
-
-        guard process.terminationStatus == 0 else {
-            if !stderrText.isEmpty {
-                throw CLIRunnerError.processFailed(stderrText)
-            }
-            throw CLIRunnerError.processFailed("Exit code: \(process.terminationStatus)")
-        }
-
-        return stdoutText
-    }
+    // MARK: - Helper Methods
 
     private func parseModelIdentifier(_ modelId: String) -> (provider: ModelProvider, modelId: String) {
         let lowercased = modelId.lowercased()
@@ -526,46 +1027,7 @@ actor CLIRunner {
             return (.minimax, modelId)
         }
 
-        // Default to ollama if no match
         return (.ollama, modelId)
-    }
-
-    private func findExecutable(_ name: String) -> String? {
-        let possiblePaths = [
-            "/usr/local/bin/\(name)",
-            "/usr/bin/\(name)",
-            "/opt/homebrew/bin/\(name)",
-            "/Users/\(NSUserName())/.local/bin/\(name)"
-        ]
-
-        for path in possiblePaths {
-            if FileManager.default.fileExists(atPath: path) {
-                return path
-            }
-        }
-
-        // Try which
-        let whichProcess = Process()
-        whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        whichProcess.arguments = [name]
-
-        let pipe = Pipe()
-        whichProcess.standardOutput = pipe
-
-        do {
-            try whichProcess.run()
-            whichProcess.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let path = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               !path.isEmpty {
-                return path
-            }
-        } catch {
-            // Ignore
-        }
-
-        return nil
     }
 
     // MARK: - ANSI Stripping
@@ -574,7 +1036,6 @@ actor CLIRunner {
         var result = text
 
         // Remove all escape sequences starting with ESC [ ... (CSI sequences)
-        // This is more aggressive to catch all variants like [?25h, [?2026h, [1S, etc.
         if let regex = try? NSRegularExpression(pattern: "\u{1B}\\[(\\?\\d+|[0-9;])*[A-Za-z]", options: []) {
             let range = NSRange(result.startIndex..., in: result)
             result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
@@ -601,36 +1062,6 @@ actor CLIRunner {
 
         // Remove remaining bracket sequences that might have been missed
         if let regex = try? NSRegularExpression(pattern: "\\[(\\?|[0-9])[0-9;]*[A-Za-z]?", options: []) {
-            let range = NSRange(result.startIndex..., in: result)
-            result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
-        }
-
-        return result
-    }
-
-    // Handle output from cat -v which converts escape sequences to readable form
-    // e.g., ESC[ becomes ^[, M- becomes ^M, etc.
-    private func stripCatV(_ text: String) -> String {
-        var result = text
-
-        // cat -v converts ESC to ^[, so we need to handle both
-        // Remove ^[[ patterns (cat -v representation of ESC[)
-        if let regex = try? NSRegularExpression(pattern: "\\^\\[[0-9;]*[A-Za-z]*", options: []) {
-            let range = NSRange(result.startIndex..., in: result)
-            result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
-        }
-
-        // Remove ^[ patterns (ESC character)
-        result = result.replacingOccurrences(of: "^[[", with: "")
-        result = result.replacingOccurrences(of: "^[", with: "")
-
-        // Remove cursor movement codes that appear in cat -v output
-        result = result.replacingOccurrences(of: "[?25l", with: "")
-        result = result.replacingOccurrences(of: "[?25h", with: "")
-
-        // Remove any remaining control character representations from cat -v
-        // cat -v uses ^X for control characters and M-c for meta characters
-        if let regex = try? NSRegularExpression(pattern: "\\^[A-Z\\[\\]\\\\@]", options: []) {
             let range = NSRange(result.startIndex..., in: result)
             result = regex.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
         }

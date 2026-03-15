@@ -59,6 +59,7 @@ struct SettingsView: View {
                     directoryRow(label: "Inbox", path: $viewModel.settings.inboxPath)
                     directoryRow(label: "Processing", path: $viewModel.settings.processingPath)
                     directoryRow(label: "Completed", path: $viewModel.settings.completedPath)
+                    directoryRow(label: "Project", path: $viewModel.settings.projectDirectory)
                 }
 
                 Section("CLI Configuration") {
@@ -77,6 +78,57 @@ struct SettingsView: View {
                             .frame(width: 100, alignment: .leading)
                         TextField("llama3", text: $viewModel.settings.ollamaModelName)
                             .textFieldStyle(.roundedBorder)
+                    }
+                }
+
+                Section("MiniMax Configuration") {
+                    Text("Configure MiniMax agent (uses Claude CLI with ANTHROPIC_BASE_URL override).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    HStack {
+                        Text("Base URL")
+                            .frame(width: 100, alignment: .leading)
+                        TextField("https://api.minimax.io/anthropic", text: $viewModel.settings.minimaxBaseURL)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption.monospaced())
+                    }
+
+                    HStack {
+                        Text("Auth Token")
+                            .frame(width: 100, alignment: .leading)
+                        SecureField("API token", text: $viewModel.settings.minimaxAuthToken)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    HStack {
+                        Text("Model")
+                            .frame(width: 100, alignment: .leading)
+                        TextField("kimi-k2.5:cloud", text: $viewModel.settings.minimaxModelName)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                }
+
+                Section("Orchestration Script") {
+                    Toggle("Use orchestrate.sh", isOn: $viewModel.settings.useOrchestrateScript)
+
+                    if viewModel.settings.useOrchestrateScript {
+                        Text("When enabled, AgentBox will delegate orchestration to the shell script instead of using native Swift implementation.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        HStack {
+                            Text("Script Path")
+                                .frame(width: 100, alignment: .leading)
+                            TextField("path/to/orchestrate.sh", text: $viewModel.settings.orchestrateScriptPath)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption.monospaced())
+
+                            Button("Choose") {
+                                chooseOrchestrateScript()
+                            }
+                            .buttonStyle(.bordered)
+                        }
                     }
                 }
 
@@ -165,6 +217,23 @@ struct SettingsView: View {
 
         if panel.runModal() == .OK, let url = panel.url {
             path.wrappedValue = url.standardizedFileURL.path
+        }
+    }
+
+    private func chooseOrchestrateScript() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = true
+        panel.treatsFilePackagesAsDirectories = false
+        panel.prompt = "Select"
+        panel.allowedContentTypes = [.shellScript, .executable]
+        panel.directoryURL = URL(fileURLWithPath: "/usr/local/bin")
+
+        if panel.runModal() == .OK, let url = panel.url {
+            viewModel.settings.orchestrateScriptPath = url.standardizedFileURL.path
         }
     }
 

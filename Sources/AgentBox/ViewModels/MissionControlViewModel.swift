@@ -283,57 +283,76 @@ final class MissionControlViewModel: ObservableObject {
     }
 
     /// Runs Phase 2 (parallel wave 1 + parallel wave 2) and Phase 3 (consolidation).
+    /// Uses error isolation - individual subtask failures don't abort the orchestration (mirrors orchestrate.sh).
     private func runMultiAgentOrchestration(cliRunner: CLIRunner, mission: MissionRecord, plan: OrchestratorPlan, processingURL: URL) async throws -> String {
         let instruction = (try? String(contentsOf: processingURL, encoding: .utf8)) ?? mission.fileName
         let capturedSettings = settings
 
         var taskResults: [String: String] = [:]
+        var failedTasks: [String: String] = [:] // Track failed tasks for reporting
 
-        // Phase 2, Wave 1: independent tasks run in parallel
+        // Phase 2, Wave 1: independent tasks run in parallel (with error isolation)
         let wave1 = plan.subtasks.filter { $0.dependsOn.isEmpty }
         if !wave1.isEmpty {
-            var wave1Results: [(String, String)] = []
-            try await withThrowingTaskGroup(of: (String, String).self) { group in
+            await withTaskGroup(of: (String, String?, Error?).self) { group in
                 for subtask in wave1 {
                     group.addTask {
-                        let result = try await cliRunner.executeSubtask(subtask, previousResults: [:], settings: capturedSettings)
-                        return (subtask.id, result)
+                        let (result, error) = await cliRunner.executeSubtask(subtask, previousResults: [:], settings: capturedSettings)
+                        if let error = error {
+                            return (subtask.id, nil, error)
+                        }
+                        return (subtask.id, result, nil)
                     }
                 }
-                for try await pair in group {
-                    wave1Results.append(pair)
+
+                for await (taskId, result, error) in group {
+                    if let result = result {
+                        taskResults[taskId] = result
+                    } else if let error = error {
+                        failedTasks[taskId] = error.localizedDescription
+                        print("[MissionControl] Wave 1 task \(taskId) failed: \(error.localizedDescription)")
+                    }
                 }
-            }
-            for (taskId, result) in wave1Results {
-                taskResults[taskId] = result
             }
         }
 
         // Phase 2, Wave 2: dependent tasks run in parallel, each injecting available wave 1 context
         let wave2 = plan.subtasks.filter { !$0.dependsOn.isEmpty }
         if !wave2.isEmpty {
-            var wave2Results: [(String, String)] = []
             let capturedTaskResults = taskResults
-            try await withThrowingTaskGroup(of: (String, String).self) { group in
+            await withTaskGroup(of: (String, String?, Error?).self) { group in
                 for subtask in wave2 {
                     let depResults = subtask.dependsOn.reduce(into: [String: String]()) { dict, depId in
                         dict[depId] = capturedTaskResults[depId]
                     }
                     group.addTask {
-                        let result = try await cliRunner.executeSubtask(subtask, previousResults: depResults, settings: capturedSettings)
-                        return (subtask.id, result)
+                        let (result, error) = await cliRunner.executeSubtask(subtask, previousResults: depResults, settings: capturedSettings)
+                        if let error = error {
+                            return (subtask.id, nil, error)
+                        }
+                        return (subtask.id, result, nil)
                     }
                 }
-                for try await pair in group {
-                    wave2Results.append(pair)
+
+                for await (taskId, result, error) in group {
+                    if let result = result {
+                        taskResults[taskId] = result
+                    } else if let error = error {
+                        failedTasks[taskId] = error.localizedDescription
+                        print("[MissionControl] Wave 2 task \(taskId) failed: \(error.localizedDescription)")
+                    }
                 }
-            }
-            for (taskId, result) in wave2Results {
-                taskResults[taskId] = result
             }
         }
 
+        // Log failed tasks if any
+        if !failedTasks.isEmpty {
+            let failedList = failedTasks.map { "\($0.key): \($0.value)" }.joined(separator: ", ")
+            print("[MissionControl] Completed with \(failedTasks.count) failed task(s): \(failedList)")
+        }
+
         // Phase 3: Consolidate all results into a final report
+        // Even if some tasks failed, we still try to consolidate
         return try await cliRunner.consolidateResults(
             originalTask: instruction,
             plan: plan,
