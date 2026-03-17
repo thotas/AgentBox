@@ -9,7 +9,7 @@ struct SettingsView: View {
 
     // Model options - CLI only
     private let cliModels = ["claude-cli", "codex-cli", "gemini-cli", "minimax-cli"]
-    private let ollamaModels = ["ollama llama3", "ollama qwen3.5"]
+    private let ollamaModels = ["ollama llama3.3", "ollama qwen2.5-coder"]
 
     private var allModels: [String] {
         cliModels + ollamaModels

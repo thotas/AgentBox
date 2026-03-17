@@ -171,11 +171,3 @@ actor PythonRunner {
         }
     }
 }
-
-// MARK: - Legacy Bridge Output (for compatibility)
-
-struct PythonBridgeOutput: Codable {
-    var plan: String?
-    var result: String?
-    var error: String?
-}

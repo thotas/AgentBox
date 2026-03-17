@@ -109,7 +109,13 @@ Store API keys in macOS Keychain (or fallback to `~/AgentBox/Secrets.json`):
 ## Build App Bundle
 
 ```bash
+# Generate high-resolution app icons (requires Pillow)
+python3 generate_icon.py
+
+# Build the app
 swift build -c release
+
+# Create app bundle
 rm -rf AgentBox.app
 mkdir -p AgentBox.app/Contents/MacOS AgentBox.app/Contents/Resources
 cp .build/arm64-apple-macosx/release/AgentBox AgentBox.app/Contents/MacOS/AgentBox
@@ -118,10 +124,23 @@ cp -R .build/arm64-apple-macosx/release/AgentBox_AgentBox.bundle/Scripts AgentBo
 cp Info.plist AgentBox.app/Contents/Info.plist
 ```
 
+### App Icon
+The app uses a custom-designed icon created by `generate_icon.py`. This script generates all required macOS icon sizes (16x16 to 512x512 @2x) with:
+- Apple-style rounded corners
+- Gradient background (deep blue to purple)
+- Agent orchestration motif (connected nodes representing manager/worker pattern)
+
 ## Run
 
 ```bash
+# Option 1: Run from current directory
 open AgentBox.app
+
+# Option 2: Install to ~/Applications/myApps/
+mkdir -p ~/Applications/myApps
+rm -rf ~/Applications/myApps/AgentBox.app
+mv AgentBox.app ~/Applications/myApps/
+open ~/Applications/myApps/AgentBox.app
 ```
 
 ## Tests
