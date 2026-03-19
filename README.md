@@ -125,10 +125,11 @@ cp Info.plist AgentBox.app/Contents/Info.plist
 ```
 
 ### App Icon
-The app uses a custom-designed icon created by `generate_icon.py`. This script generates all required macOS icon sizes (16x16 to 512x512 @2x) with:
-- Apple-style rounded corners
-- Gradient background (deep blue to purple)
-- Agent orchestration motif (connected nodes representing manager/worker pattern)
+The app uses a custom-designed Apple-style icon created by `generate_icon.py`. This script generates all required macOS icon sizes (16x16 to 512x512 @2x) with:
+- Apple News-inspired vibrant gradient (blue to purple to pink)
+- Apple-style rounded corners and subtle shine effect
+- Modern "AB" monogram representing AgentBox
+- Premium inner glow and outer glow effects for a polished look
 
 ## Run
 
